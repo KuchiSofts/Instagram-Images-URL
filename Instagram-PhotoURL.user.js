@@ -1,59 +1,110 @@
 // ==UserScript==
 // @name         Get Instagram Photo URL
 // @namespace    https://kuchi.be/
-// @version      1.4
-// @description  Allow "Copy image link" on Instagram Photos
-// @author       Kuchi
-// @defaulticon     https://raw.githubusercontent.com/KuchiSofts/Insagram-Images-URL/main/instagram.icon.png
-// @icon            https://raw.githubusercontent.com/KuchiSofts/Insagram-Images-URL/main/instagram.icon.png
-// @updateURL       https://github.com/KuchiSofts/Insagram-Images-URL/raw/main/Instagram-PhotoURL.user.js
-// @downloadURL     https://github.com/KuchiSofts/Insagram-Images-URL/raw/main/Instagram-PhotoURL.user.js
-// @match        *://www.instagram.com/*
-// @match        *://instagram.com/*
-// @run-at          document-start
+// @version      1.5
+// @description  Allow "Copy image link" / "Open image in new tab" on Instagram Photos
+// @author       Kuchi - Soft's
+// @license      GPL-3.0
+// @defaulticon  https://raw.githubusercontent.com/KuchiSofts/Instagram-Images-URL/main/instagram.icon.png
+// @icon         https://raw.githubusercontent.com/KuchiSofts/Instagram-Images-URL/main/instagram.icon.png
+// @homepageURL  https://github.com/KuchiSofts/Instagram-Images-URL
+// @supportURL   https://github.com/KuchiSofts/Instagram-Images-URL/issues
+// @updateURL    https://raw.githubusercontent.com/KuchiSofts/Instagram-Images-URL/main/Instagram-PhotoURL.user.js
+// @downloadURL  https://raw.githubusercontent.com/KuchiSofts/Instagram-Images-URL/main/Instagram-PhotoURL.user.js
+// @match        https://www.instagram.com/*
+// @match        https://instagram.com/*
+// @run-at       document-start
 // @grant        none
-// @priority        9000
 // ==/UserScript==
 
 (function() {
   'use strict';
 
-  // Function to set the z-index of images with alt attribute containing "Photo by" or "Photo shared"
-  function setZIndex() {
-    // Get all images on the page with alt attribute containing "Photo by" or "Photo shared"
-    const images = document.querySelectorAll('img[alt*="Photo by"], img[alt*="Photo shared"]');
+  // Instagram covers post images with an empty <div> that swallows right clicks.
+  // This script lets the right click reach the <img> again, so the browser menu
+  // shows "Copy image link" / "Open image in new tab" / "Save image as".
 
-    // Loop through the images and set their z-index to a high value
-    images.forEach(image => {
-      image.style.zIndex = '999';
+  const PROCESSED = 'data-kiu-done';
+  const TRIES = 'data-kiu-tries';
+  const MAX_TRIES = 5;
 
-      // Check the srcset attribute for additional image sources
-      const srcset = image.getAttribute('srcset');
-      if (srcset) {
-        // Split the srcset by comma and space
-        const sources = srcset.split(',').map(source => source.trim());
+  // Images served by Instagram's CDN, in posts, the feed, the post dialog and profiles.
+  // Language-independent: matches on the image host, not on the alt text.
+  const IMAGE_SELECTOR = [
+    'article img',
+    'main img',
+    'div[role="dialog"] img',
+    'div[role="presentation"] img'
+  ].map(sel => sel + ':not([' + PROCESSED + '])').join(', ');
 
-        // Filter out sources that don't have http or https
-        const httpSources = sources.filter(source => /^(https?:\/\/).+/.test(source));
-        // Set the first filtered source as the new image src
-        if (httpSources.length > 0) {
-          const newSrc = httpSources[0].split(' ')[0];
-          const newImage = new Image();
-          // Copy over all the attributes and styles from the original image
-          Array.from(image.attributes).forEach(attr => {
-            newImage.setAttribute(attr.name, attr.value);
-          });
-          newImage.style.cssText = image.style.cssText;
-          newImage.setAttribute('src', newSrc);
-          // Replace the original image with the new one
-          image.parentNode.replaceChild(newImage, image);
+  const CDN_RE = /^https?:\/\/[^/]*(cdninstagram\.com|fbcdn\.net)\//;
+
+  // How many ancestor levels to look at for a covering overlay
+  const MAX_DEPTH = 3;
+
+  function isCdnImage(img) {
+    const src = img.getAttribute('src') || '';
+    const srcset = img.getAttribute('srcset') || '';
+    return CDN_RE.test(src) || CDN_RE.test(srcset.trim());
+  }
+
+  // An overlay is an empty, absolutely positioned element stacked over the image
+  function isOverlay(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.childElementCount !== 0 || el.textContent.trim() !== '') return false;
+    const position = getComputedStyle(el).position;
+    return position === 'absolute' || position === 'fixed';
+  }
+
+  function unblock(img) {
+    // No z-index tricks on the image: raising it would cover carousel arrows and tags.
+    // Let clicks pass through empty overlays next to the image or its wrappers.
+    // Events still bubble to the same React ancestors, so double-tap like keeps working.
+    let found = false;
+    let node = img;
+    for (let depth = 0; depth < MAX_DEPTH && node && node.parentElement; depth++) {
+      for (let sib = node.nextElementSibling; sib; sib = sib.nextElementSibling) {
+        if (isOverlay(sib)) {
+          sib.style.pointerEvents = 'none';
+          found = true;
         }
       }
+      node = node.parentElement;
+    }
+
+    // Done when an overlay was handled; otherwise retry a few times (it may render later)
+    const tries = parseInt(img.getAttribute(TRIES) || '0', 10) + 1;
+    if (found || tries >= MAX_TRIES) {
+      img.setAttribute(PROCESSED, '');
+    } else {
+      img.setAttribute(TRIES, String(tries));
+    }
+  }
+
+  function scan() {
+    document.querySelectorAll(IMAGE_SELECTOR).forEach(img => {
+      if (isCdnImage(img)) unblock(img);
     });
   }
 
-    setInterval(function() {
-        setZIndex();
-    }, 100);
+  // Debounced: Instagram mutates the DOM constantly while scrolling
+  let scheduled = null;
+  function scheduleScan() {
+    if (scheduled) return;
+    scheduled = setTimeout(() => {
+      scheduled = null;
+      scan();
+    }, 200);
+  }
 
+  new MutationObserver(scheduleScan).observe(document.documentElement, {
+    childList: true,
+    subtree: true
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scan);
+  } else {
+    scan();
+  }
 })();
